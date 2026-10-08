@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>scout_mini_relocalization</name>
+  <version>0.1.0</version>
+  <description>Manual initialization and continuous GICP map localization without odometry feedback.</description>
+  <maintainer email="3304257104@qq.com">FAKECK-droid</maintainer>
+  <license>Apache-2.0</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>diagnostic_msgs</depend>
+  <depend>tf2_ros</depend>
+  <depend>pcl_conversions</depend>
+  <depend>eigen</depend>
+  <depend>libpcl-all-dev</depend>
+  <!-- small_gicp is the pinned upstream CMake installation in this workspace,
+       not a ROS package or a Humble rosdep key. See README for its prefix. -->
+  <exec_depend>launch_ros</exec_depend>
+  <test_depend>rclpy</test_depend>
+  <test_depend>nav_msgs</test_depend>
+  <test_depend>robot_localization</test_depend>
+  <test_depend>tf2_msgs</test_depend>
+  <test_depend>rosgraph_msgs</test_depend>
+  <test_depend>sensor_msgs_py</test_depend>
+  <test_depend>python3-numpy</test_depend>
+  <test_depend>python3-yaml</test_depend>
+  <export><build_type>ament_cmake</build_type></export>
+</package>

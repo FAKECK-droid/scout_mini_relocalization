@@ -1,0 +1,47 @@
+small_gicp_relocalizer:
+  ros__parameters:
+    # prior_pcd_file and IMU-lidar extrinsic arrays are supplied by project launch.
+    cloud_topic: /cloud_registered_body
+    initialpose_topic: /initialpose
+    map_frame: map
+    odom_frame: odom
+    base_frame: base_link
+    cloud_frame: body
+    lidar_frame: lidar
+    registration_rate: 1.0
+    tf_publish_rate: 20.0
+    num_threads: 2
+    map_leaf_size: 0.30
+    scan_leaf_size: 0.30
+    num_neighbors: 20
+    max_correspondence_distance: 1.0
+    max_iterations: 40
+    translation_eps: 0.001
+    rotation_eps: 0.001745
+    min_source_points: 200
+    min_inliers: 100
+    min_inlier_ratio: 0.50
+    max_euclidean_rmse: 0.30
+    init_max_translation: 1.0
+    init_max_rotation: 0.261799
+    track_max_translation: 0.50
+    track_max_rotation: 0.174533
+    confirmation_translation: 0.20
+    confirmation_rotation: 0.052360
+    confirmation_frames: 2
+    max_scan_age: 0.50
+    tf_wait_timeout: 0.20
+    initialization_timeout: 10.0
+    max_job_age: 1.0
+    degraded_after: 3.0
+    tf_hold_timeout: 5.0
+    failures_before_degraded: 3
+    # Set true and calibrate initial_base_z for RViz 2D seeds in the native PCD frame.
+    use_initial_base_z: false
+    initial_base_z: 0.0
+    publish_aligned_cloud: false
+    # A conservative discontinuity detector; it cannot detect every odom reset.
+    odom_jump_translation: 2.0
+    odom_jump_rotation: 1.570796
+    max_expected_linear_speed: 3.0
+    max_expected_angular_speed: 3.0
