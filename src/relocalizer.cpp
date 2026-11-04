@@ -120,6 +120,7 @@ public:
     max_scan_age_ = positive("max_scan_age", 0.50);
     tf_wait_ = positive("tf_wait_timeout", 0.20);
     init_timeout_ = positive("initialization_timeout", 10.0);
+    initialpose_use_latest_tf_ = declare_parameter<bool>("initialpose_use_latest_tf", true);
     max_job_age_ = positive("max_job_age", 1.0);
     degraded_after_ = positive("degraded_after", 3.0);
     hold_timeout_ = positive("tf_hold_timeout", 5.0);
@@ -255,7 +256,12 @@ private:
   void on_seed(const PoseSeed & message)
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (message.header.frame_id != map_frame_) {reason_ = "wrong_initialpose_frame"; return;}
+    if (message.header.frame_id != map_frame_) {
+      reason_ = "wrong_initialpose_frame";
+      RCLCPP_WARN(get_logger(), "Initial pose frame '%s' must be '%s'",
+        message.header.frame_id.c_str(), map_frame_.c_str());
+      return;
+    }
     try {
       auto pose = from_pose(message.pose.pose);
       if (use_base_z_) {pose.translation().z() = initial_z_;}
@@ -270,8 +276,11 @@ private:
       dispatched_stamp_ = 0;
       initializing_started_ = Steady::now();
       reason_ = "waiting_initialpose_tf";
-    } catch (const std::exception &) {
+      RCLCPP_INFO(get_logger(), "Initial pose received in %s; waiting for %s -> %s TF",
+        map_frame_.c_str(), odom_frame_.c_str(), base_frame_.c_str());
+    } catch (const std::exception & error) {
       reason_ = "invalid_initialpose";
+      RCLCPP_WARN(get_logger(), "Invalid initial pose: %s", error.what());
     }
   }
 
@@ -310,6 +319,8 @@ private:
     confirmations_ = 0;
     confirmed_.reset();
     reason_ = reason;
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+      "Relocalization observation rejected: %s", reason.c_str());
   }
 
   void tick()
@@ -340,14 +351,26 @@ private:
     }
     if (pending_pose_) {
       Eigen::Isometry3d odom_base;
-      if (lookup(odom_frame_, base_frame_, pending_seed_stamp_, odom_base)) {
+      // A manual map pose is a coarse seed. Latest odometry avoids rejecting a
+      // fresh RViz click simply because the corresponding EKF TF arrives later.
+      const int64_t seed_stamp = initialpose_use_latest_tf_ ? 0 : pending_seed_stamp_;
+      if (lookup(odom_frame_, base_frame_, seed_stamp, odom_base)) {
         seed_ = map_from_odom(*pending_pose_, odom_base);
         pending_pose_.reset();
+        initializing_started_ = wall;
         next_job_ = wall;
         reason_ = "initializing";
-      } else if (std::chrono::duration<double>(wall - initializing_started_).count() > tf_wait_) {
+        RCLCPP_INFO(get_logger(), "Initial pose paired with odometry TF; starting registration");
+      } else if (std::chrono::duration<double>(wall - initializing_started_).count() > init_timeout_) {
         pending_pose_.reset();
         reason_ = "initialpose_tf_timeout";
+        RCLCPP_ERROR(get_logger(),
+          "Initial pose timed out after %.1fs: missing %s -> %s TF; check EKF/LIO",
+          init_timeout_, odom_frame_.c_str(), base_frame_.c_str());
+      } else {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+          "Waiting for %s -> %s TF; initial pose retained",
+          odom_frame_.c_str(), base_frame_.c_str());
       }
     }
     if (seed_ && std::chrono::duration<double>(wall - initializing_started_).count() > init_timeout_) {
@@ -356,6 +379,8 @@ private:
       confirmed_.reset();
       confirmations_ = 0;
       reason_ = "initialization_timeout";
+      RCLCPP_ERROR(get_logger(),
+        "Registration initialization timed out; see rejection reason and /relocalization/status");
     }
 
     if (!busy_ && !job_ && base_body_ && (seed_ || correction_) &&
@@ -526,6 +551,8 @@ private:
         if (confirmations_ < confirmation_frames_) {continue;}
         seed_.reset();
         confirmed_.reset();
+        RCLCPP_INFO(get_logger(), "Relocalization initialized; publishing %s -> %s TF",
+          map_frame_.c_str(), odom_frame_.c_str());
       }
       correction_ = candidate;
       accepted_stamp_ = task->stamp;
@@ -594,7 +621,8 @@ private:
   double max_linear_speed_, max_angular_speed_, initial_z_;
   int neighbors_, min_source_, min_inliers_, confirmation_frames_, confirmations_ = 0;
   int failures_limit_, failures_ = 0;
-  bool use_base_z_, aligned_enabled_, stopping_ = false, busy_ = false;
+  bool use_base_z_, aligned_enabled_, initialpose_use_latest_tf_;
+  bool stopping_ = false, busy_ = false;
   int64_t last_clock_ = 0, pending_seed_stamp_ = 0, dispatched_stamp_ = 0;
   int64_t accepted_stamp_ = 0, previous_odom_stamp_ = 0;
   uint64_t generation_ = 0;

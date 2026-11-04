@@ -31,6 +31,9 @@ small_gicp_relocalizer:
     confirmation_frames: 2
     max_scan_age: 0.50
     tf_wait_timeout: 0.20
+    # RViz manual seeds use the latest available EKF pose; scans keep their exact-time TF.
+    initialpose_use_latest_tf: true
+    # Separate timeout for awaiting initial odometry and for registration confirmation.
     initialization_timeout: 10.0
     max_job_age: 1.0
     degraded_after: 3.0

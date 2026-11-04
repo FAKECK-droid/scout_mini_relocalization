@@ -70,8 +70,8 @@ RViz Fixed Frame 设为 `map`，用 2D Pose Estimate 给出 map 中
 | 接口 | 方向 | 说明 |
 | --- | --- | --- |
 | /cloud_registered_body | 订阅 PointCloud2，best effort，深度 1 | 有时间戳的 body 帧、FLOAT32 XYZ；输入话题和 frame 可配 |
-| /initialpose | 订阅 PoseWithCovarianceStamped | frame 必须为 map；表达 base_link；零时间戳绑定接收时 ROS 时间 |
-| /tf、/tf_static | 读取 | 静态安装外参、扫描和初值时刻的 EKF TF |
+| /initialpose | 订阅 PoseWithCovarianceStamped | frame 必须为 map；表达 base_link；默认与最新可用里程计 TF 配对；可切换严格时间戳模式 |
+| /tf、/tf_static | 读取 | 静态安装外参、扫描时刻的 EKF TF，以及初始化使用的里程计 TF |
 | map → odom | 唯一 TF 输出 | 当前 ROS 时间刷新最近接受的修正，无未来时间偏移 |
 | /relocalization/pose | 发布 PoseStamped | 扫描时间的 map 中 base_link 位姿 |
 | /relocalization/map_cloud | 发布 PointCloud2 | 降采样先验地图，reliable/transient_local，深度 1 |
@@ -148,3 +148,23 @@ cppcheck（安装版本 2.7 被工具跳过）、lint_cmake 和 xmllint 返回�
 
 这些结果证明本次合成回放的接口与数值隔离；真实 MID360/PCD 的精度和
 CPU 竞争、50 Hz EKF 实流性能仍未验收。没有运行真实底盘或发布运动命令。
+
+
+## 2026-11-03 RViz 初始化等待修复
+
+默认 initialpose_use_latest_tf=true：RViz 的 map 初始位姿与最新可用
+odom → base_link 配对，避免因点击时刻 TF 尚未到达而在 0.2 秒后丢弃初值。
+完全没有里程计 TF 时，保留初值等待 initialization_timeout（默认 10 秒）。
+取得 TF 后重新开始计时，另留完整的 10 秒用于点云初始化和连续帧确认。
+
+这只改变人工粗初值的时间配对；扫描配准继续查询每帧点云采集时刻的 TF。
+initialpose_use_latest_tf=false 可恢复按初始位姿消息时间戳查询。
+tf_wait_timeout 继续用于扫描 TF 等待。
+
+终端会打印初值已接收、等待里程计、开始配准、初始化成功，或明确的超时/
+配准拒绝原因。初始化成功前仍不发布假的单位 map → odom。
+RViz 的 Fixed Frame 应为 map，2D Pose Estimate 发布到 /initialpose。
+map → odom 建立后，依赖该变换的 RViz 消息才能解除等待。
+
+本轮只构建安装，按用户要求不运行测试或启动硬件。当前停止程序时不会有
+/initialpose 订阅者；请在重定位节点启动并显示 Map loaded 后再点击初值。
