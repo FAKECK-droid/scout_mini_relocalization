@@ -19,6 +19,8 @@ struct Quality
   double hessian_min_eigenvalue = 0.0;
   double hessian_condition = std::numeric_limits<double>::infinity();
   double processing_ms = 0.0;
+  double correction_translation = std::numeric_limits<double>::infinity();
+  double correction_rotation = std::numeric_limits<double>::infinity();
 };
 
 inline Quality measure_quality(
@@ -65,7 +67,8 @@ inline Quality measure_quality(
 inline std::string rejection_reason(
   const small_gicp::RegistrationResult & result, const Quality & quality,
   const Eigen::Isometry3d & guess, size_t min_source, size_t min_inliers,
-  double min_ratio, double max_rmse, double max_translation, double max_rotation)
+  double min_ratio, double max_rmse, double max_translation, double max_rotation,
+  bool check_correction = true)
 {
   if (!result.converged) {return "not_converged";}
   if (!valid_transform(result.T_target_source) || !result.H.allFinite() ||
@@ -83,7 +86,9 @@ inline std::string rejection_reason(
     return "insufficient_inlier_ratio";
   }
   if (!std::isfinite(quality.rmse) || quality.rmse > max_rmse) {return "euclidean_rmse";}
-  if (!nearby(guess, result.T_target_source, max_translation, max_rotation)) {
+  if (check_correction &&
+    !nearby(guess, result.T_target_source, max_translation, max_rotation))
+  {
     return "correction_jump";
   }
   return {};

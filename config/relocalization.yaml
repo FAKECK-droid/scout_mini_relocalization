@@ -22,6 +22,9 @@ small_gicp_relocalizer:
     min_inliers: 100
     min_inlier_ratio: 0.50
     max_euclidean_rmse: 0.30
+    # Manual initialization/reinitialization uses quality + frame confirmation.
+    # Enable this only to additionally bound correction from the coarse RViz seed.
+    initialpose_check_correction: false
     init_max_translation: 1.0
     init_max_rotation: 0.261799
     track_max_translation: 0.50
@@ -31,7 +34,10 @@ small_gicp_relocalizer:
     confirmation_frames: 2
     max_scan_age: 0.50
     tf_wait_timeout: 0.20
-    initialization_timeout: 10.0
+    # RViz manual seeds use the latest available EKF pose; scans keep their exact-time TF.
+    initialpose_use_latest_tf: true
+    # Manual initialization waits indefinitely for odometry TF and confirmation.
+    # A newer /initialpose replaces the pending request at any time.
     max_job_age: 1.0
     degraded_after: 3.0
     tf_hold_timeout: 5.0

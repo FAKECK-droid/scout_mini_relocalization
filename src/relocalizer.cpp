@@ -111,6 +111,7 @@ public:
     max_rmse_ = positive("max_euclidean_rmse", 0.30);
     init_translation_ = positive("init_max_translation", 1.0);
     init_rotation_ = positive("init_max_rotation", 0.261799);
+    initialpose_check_correction_ = declare_parameter<bool>("initialpose_check_correction", false);
     track_translation_ = positive("track_max_translation", 0.50);
     track_rotation_ = positive("track_max_rotation", 0.174533);
     confirm_translation_ = positive("confirmation_translation", 0.20);
@@ -119,7 +120,7 @@ public:
     if (confirmation_frames_ < 2) {throw std::invalid_argument("initialization requires two or more frames");}
     max_scan_age_ = positive("max_scan_age", 0.50);
     tf_wait_ = positive("tf_wait_timeout", 0.20);
-    init_timeout_ = positive("initialization_timeout", 10.0);
+    initialpose_use_latest_tf_ = declare_parameter<bool>("initialpose_use_latest_tf", true);
     max_job_age_ = positive("max_job_age", 1.0);
     degraded_after_ = positive("degraded_after", 3.0);
     hold_timeout_ = positive("tf_hold_timeout", 5.0);
@@ -148,7 +149,7 @@ public:
       rclcpp::SensorDataQoS().keep_last(1),
       [this](Cloud::ConstSharedPtr cloud) {on_cloud(std::move(cloud));});
     seed_sub_ = create_subscription<PoseSeed>(
-      declare_parameter<std::string>("initialpose_topic", "/initialpose"), 5,
+      declare_parameter<std::string>("initialpose_topic", "/initialpose"), 1,
       [this](PoseSeed::ConstSharedPtr pose) {on_seed(*pose);});
     next_job_ = next_status_ = Steady::now();
     worker_ = std::thread([this]() {work();});
@@ -255,23 +256,38 @@ private:
   void on_seed(const PoseSeed & message)
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (message.header.frame_id != map_frame_) {reason_ = "wrong_initialpose_frame"; return;}
+    if (message.header.frame_id != map_frame_) {
+      reason_ = "wrong_initialpose_frame";
+      RCLCPP_WARN(get_logger(), "Initial pose frame '%s' must be '%s'",
+        message.header.frame_id.c_str(), map_frame_.c_str());
+      return;
+    }
     try {
       auto pose = from_pose(message.pose.pose);
       if (use_base_z_) {pose.translation().z() = initial_z_;}
       const auto stamp = rclcpp::Time(message.header.stamp).nanoseconds();
       pending_seed_stamp_ = stamp == 0 ? now().nanoseconds() : stamp;
-      if (pending_seed_stamp_ <= 0) {throw std::invalid_argument("invalid initialpose stamp");}
-      pending_pose_ = pose;
+      if (!initialpose_use_latest_tf_ && pending_seed_stamp_ <= 0) {
+        throw std::invalid_argument("invalid initialpose stamp");
+      }
+      // Keep the manual map pose until confirmation, including across odom resets.
+      requested_pose_ = pending_pose_ = pose;
       seed_.reset();
       confirmed_.reset();
-      confirmations_ = 0;
+      confirmations_ = failures_ = 0;
       ++generation_;
-      dispatched_stamp_ = 0;
-      initializing_started_ = Steady::now();
+      // A running task will be discarded by its generation; cancel any queued task.
+      if (job_) {job_.reset(); busy_ = false;}
+      latest_cloud_.reset();
+      previous_odom_.reset();
+      previous_odom_stamp_ = dispatched_stamp_ = 0;
+      next_job_ = Steady::now();
       reason_ = "waiting_initialpose_tf";
-    } catch (const std::exception &) {
+      RCLCPP_INFO(get_logger(), "Initial pose received in %s; waiting for %s -> %s TF",
+        map_frame_.c_str(), odom_frame_.c_str(), base_frame_.c_str());
+    } catch (const std::exception & error) {
       reason_ = "invalid_initialpose";
+      RCLCPP_WARN(get_logger(), "Invalid initial pose: %s", error.what());
     }
   }
 
@@ -293,7 +309,8 @@ private:
     ++generation_;
     correction_.reset();
     seed_.reset();
-    pending_pose_.reset();
+    // Retry an unconfirmed manual request after the TF/odom context changes.
+    pending_pose_ = requested_pose_;
     confirmed_.reset();
     latest_cloud_.reset();
     if (job_) {busy_ = false;}
@@ -302,6 +319,10 @@ private:
     dispatched_stamp_ = accepted_stamp_ = 0;
     confirmations_ = failures_ = 0;
     reason_ = reason;
+    if (pending_pose_) {
+      RCLCPP_INFO(get_logger(), "Initial pose retained after %s; waiting for odometry TF",
+        reason.c_str());
+    }
   }
 
   void fail(const std::string & reason)
@@ -310,6 +331,22 @@ private:
     confirmations_ = 0;
     confirmed_.reset();
     reason_ = reason;
+    if (reason == "correction_jump") {
+      constexpr double rad_to_deg = 57.29577951308232;
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+        "Relocalization observation rejected: correction_jump "
+        "[mode=%s, translation %.3f/%.3fm, rotation %.1f/%.1fdeg, cloud age %.3fs]",
+        last_job_initializing_ ? "initialization" : "tracking",
+        quality_.correction_translation,
+        last_job_initializing_ ? init_translation_ : track_translation_,
+        quality_.correction_rotation * rad_to_deg,
+        (last_job_initializing_ ? init_rotation_ : track_rotation_) * rad_to_deg,
+        last_cloud_age_);
+    } else {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+        "Relocalization observation rejected: %s (cloud age %.3fs, limit %.3fs)",
+        reason.c_str(), last_cloud_age_, max_scan_age_);
+    }
   }
 
   void tick()
@@ -340,29 +377,30 @@ private:
     }
     if (pending_pose_) {
       Eigen::Isometry3d odom_base;
-      if (lookup(odom_frame_, base_frame_, pending_seed_stamp_, odom_base)) {
+      // A manual map pose is a coarse seed. Latest odometry avoids rejecting a
+      // fresh RViz click simply because the corresponding EKF TF arrives later.
+      const int64_t seed_stamp = initialpose_use_latest_tf_ ? 0 : pending_seed_stamp_;
+      if (lookup(odom_frame_, base_frame_, seed_stamp, odom_base)) {
         seed_ = map_from_odom(*pending_pose_, odom_base);
         pending_pose_.reset();
         next_job_ = wall;
         reason_ = "initializing";
-      } else if (std::chrono::duration<double>(wall - initializing_started_).count() > tf_wait_) {
-        pending_pose_.reset();
-        reason_ = "initialpose_tf_timeout";
+        RCLCPP_INFO(get_logger(), "Initial pose paired with odometry TF; starting registration");
+      } else {
+        reason_ = "waiting_initialpose_tf";
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+          "Waiting indefinitely for %s -> %s TF; initial pose retained",
+          odom_frame_.c_str(), base_frame_.c_str());
       }
     }
-    if (seed_ && std::chrono::duration<double>(wall - initializing_started_).count() > init_timeout_) {
-      ++generation_;
-      seed_.reset();
-      confirmed_.reset();
-      confirmations_ = 0;
-      reason_ = "initialization_timeout";
-    }
-
-    if (!busy_ && !job_ && base_body_ && (seed_ || correction_) &&
+    // Manual initialization has no deadline; keep trying fresh scans until it
+    // succeeds or a newer /initialpose replaces it.
+    if (!pending_pose_ && !busy_ && !job_ && base_body_ && (seed_ || correction_) &&
       latest_cloud_ && wall >= next_job_)
     {
       const auto stamp = rclcpp::Time(latest_cloud_->header.stamp).nanoseconds();
       const double age = (clock_now - stamp) * 1e-9;
+      last_cloud_age_ = age;
       Eigen::Isometry3d odom_base;
       if (stamp <= dispatched_stamp_) {
         latest_cloud_.reset();
@@ -483,9 +521,18 @@ private:
         result = small_gicp::align(*target_, *preprocessed.first, *tree_, task->guess, settings_);
         quality = measure_quality(*preprocessed.first, *tree_, result,
           settings_.max_correspondence_distance);
+        if (valid_transform(result.T_target_source)) {
+          quality.correction_translation =
+            (result.T_target_source.translation() - task->guess.translation()).norm();
+          quality.correction_rotation = rotation_distance(task->guess, result.T_target_source);
+        }
+        // A manual pose starts a new localization context. Its coarse error is
+        // checked by registration quality and consecutive-frame confirmation;
+        // normal tracking still rejects jumps relative to its accepted context.
         rejected = rejection_reason(result, quality, task->guess, min_source_, min_inliers_,
           min_ratio_, max_rmse_, task->initializing ? init_translation_ : track_translation_,
-          task->initializing ? init_rotation_ : track_rotation_);
+          task->initializing ? init_rotation_ : track_rotation_,
+          !task->initializing || initialpose_check_correction_);
         if (rejected.empty() && aligned_enabled_) {
           pcl::PointCloud<pcl::PointXYZ> display;
           display.reserve(preprocessed.first->size());
@@ -506,6 +553,7 @@ private:
       busy_ = false;
       if (stopping_ || task->generation != generation_) {continue;}
       quality_ = quality;
+      last_job_initializing_ = task->initializing;
       if (quality.processing_ms * 1e-3 > max_job_age_ ||
         (now().nanoseconds() - task->stamp) * 1e-9 > max_job_age_)
       {
@@ -525,7 +573,13 @@ private:
         reason_ = "confirming_initialization";
         if (confirmations_ < confirmation_frames_) {continue;}
         seed_.reset();
+        requested_pose_.reset();
         confirmed_.reset();
+        RCLCPP_INFO(get_logger(),
+          "Relocalization initialized; publishing %s -> %s TF "
+          "(seed correction %.3fm, %.1fdeg)",
+          map_frame_.c_str(), odom_frame_.c_str(), quality.correction_translation,
+          quality.correction_rotation * 57.29577951308232);
       }
       correction_ = candidate;
       accepted_stamp_ = task->stamp;
@@ -576,6 +630,11 @@ private:
     number("hessian_min_eigenvalue", quality_.hessian_min_eigenvalue);
     number("hessian_condition", quality_.hessian_condition);
     number("processing_ms", quality_.processing_ms);
+    number("cloud_age_s", last_cloud_age_);
+    value("registration_mode", last_job_initializing_ ? "initialization" : "tracking");
+    value("initialpose_check_correction", initialpose_check_correction_ ? "true" : "false");
+    number("correction_translation_m", quality_.correction_translation);
+    number("correction_rotation_rad", quality_.correction_rotation);
     number("last_success_stamp_ns", accepted_stamp_);
     number("correction_age_s", correction_age);
     value("tf_refreshing", correction_ && correction_age >= 0.0 &&
@@ -586,15 +645,19 @@ private:
 
   std::string map_frame_, odom_frame_, base_frame_, cloud_frame_, lidar_frame_;
   Eigen::Isometry3d imu_lidar_;
-  std::optional<Eigen::Isometry3d> base_body_, pending_pose_, seed_, confirmed_, correction_, previous_odom_;
+  std::optional<Eigen::Isometry3d> base_body_, requested_pose_, pending_pose_, seed_;
+  std::optional<Eigen::Isometry3d> confirmed_, correction_, previous_odom_;
   double registration_rate_, map_leaf_, scan_leaf_, min_ratio_, max_rmse_;
   double init_translation_, init_rotation_, track_translation_, track_rotation_;
-  double confirm_translation_, confirm_rotation_, max_scan_age_, tf_wait_, init_timeout_, max_job_age_;
+  double confirm_translation_, confirm_rotation_, max_scan_age_, tf_wait_, max_job_age_;
   double degraded_after_, hold_timeout_, odom_jump_translation_, odom_jump_rotation_;
   double max_linear_speed_, max_angular_speed_, initial_z_;
+  double last_cloud_age_ = 0.0;
   int neighbors_, min_source_, min_inliers_, confirmation_frames_, confirmations_ = 0;
   int failures_limit_, failures_ = 0;
-  bool use_base_z_, aligned_enabled_, stopping_ = false, busy_ = false;
+  bool use_base_z_, aligned_enabled_, initialpose_use_latest_tf_, initialpose_check_correction_;
+  bool last_job_initializing_ = false;
+  bool stopping_ = false, busy_ = false;
   int64_t last_clock_ = 0, pending_seed_stamp_ = 0, dispatched_stamp_ = 0;
   int64_t accepted_stamp_ = 0, previous_odom_stamp_ = 0;
   uint64_t generation_ = 0;
@@ -605,7 +668,7 @@ private:
   std::string reason_ = "waiting_initialpose";
   Cloud::ConstSharedPtr latest_cloud_;
   std::optional<Job> job_;
-  Steady::time_point next_job_, next_status_, cloud_received_, initializing_started_;
+  Steady::time_point next_job_, next_status_, cloud_received_;
   std::mutex mutex_;
   std::condition_variable condition_;
   std::thread worker_;
