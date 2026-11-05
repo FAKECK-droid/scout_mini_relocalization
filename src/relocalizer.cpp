@@ -383,7 +383,6 @@ private:
       if (lookup(odom_frame_, base_frame_, seed_stamp, odom_base)) {
         seed_ = map_from_odom(*pending_pose_, odom_base);
         pending_pose_.reset();
-        initializing_started_ = wall;
         next_job_ = wall;
         reason_ = "initializing";
         RCLCPP_INFO(get_logger(), "Initial pose paired with odometry TF; starting registration");
