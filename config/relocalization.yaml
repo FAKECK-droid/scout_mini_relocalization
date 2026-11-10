@@ -40,7 +40,6 @@ small_gicp_relocalizer:
     # A newer /initialpose replaces the pending request at any time.
     max_job_age: 1.0
     degraded_after: 3.0
-    tf_hold_timeout: 5.0
     failures_before_degraded: 3
     # Set true and calibrate initial_base_z for RViz 2D seeds in the native PCD frame.
     use_initial_base_z: false

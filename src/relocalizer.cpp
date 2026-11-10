@@ -123,8 +123,6 @@ public:
     initialpose_use_latest_tf_ = declare_parameter<bool>("initialpose_use_latest_tf", true);
     max_job_age_ = positive("max_job_age", 1.0);
     degraded_after_ = positive("degraded_after", 3.0);
-    hold_timeout_ = positive("tf_hold_timeout", 5.0);
-    if (hold_timeout_ < degraded_after_) {throw std::invalid_argument("tf_hold_timeout < degraded_after");}
     failures_limit_ = positive_int("failures_before_degraded", 3);
     odom_jump_translation_ = positive("odom_jump_translation", 2.0);
     odom_jump_rotation_ = positive("odom_jump_rotation", 1.570796);
@@ -439,7 +437,8 @@ private:
     }
 
     const double correction_age = accepted_stamp_ ? (clock_now - accepted_stamp_) * 1e-9 : -1.0;
-    if (correction_ && correction_age >= 0.0 && correction_age <= hold_timeout_) {
+    // Broadcast the last accepted correction at the current time, even while degraded.
+    if (correction_) {
       geometry_msgs::msg::TransformStamped tf;
       tf.header.stamp = rclcpp::Time(clock_now, get_clock()->get_clock_type());
       tf.header.frame_id = map_frame_;
@@ -637,8 +636,7 @@ private:
     number("correction_rotation_rad", quality_.correction_rotation);
     number("last_success_stamp_ns", accepted_stamp_);
     number("correction_age_s", correction_age);
-    value("tf_refreshing", correction_ && correction_age >= 0.0 &&
-      correction_age <= hold_timeout_ ? "true" : "false");
+    value("tf_refreshing", correction_ ? "true" : "false");
     message.status.push_back(std::move(status));
     status_pub_->publish(message);
   }
@@ -650,7 +648,7 @@ private:
   double registration_rate_, map_leaf_, scan_leaf_, min_ratio_, max_rmse_;
   double init_translation_, init_rotation_, track_translation_, track_rotation_;
   double confirm_translation_, confirm_rotation_, max_scan_age_, tf_wait_, max_job_age_;
-  double degraded_after_, hold_timeout_, odom_jump_translation_, odom_jump_rotation_;
+  double degraded_after_, odom_jump_translation_, odom_jump_rotation_;
   double max_linear_speed_, max_angular_speed_, initial_z_;
   double last_cloud_age_ = 0.0;
   int neighbors_, min_source_, min_inliers_, confirmation_frames_, confirmations_ = 0;

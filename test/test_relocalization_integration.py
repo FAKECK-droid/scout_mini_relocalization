@@ -18,11 +18,13 @@ from builtin_interfaces.msg import Time
 from diagnostic_msgs.msg import DiagnosticArray
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, TransformStamped
 from rclpy.qos import QoSProfile, DurabilityPolicy, qos_profile_sensor_data
+from rclpy.time import Time as RosTime
 from rosgraph_msgs.msg import Clock
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2
 from std_msgs.msg import Header
 from tf2_msgs.msg import TFMessage
+from tf2_ros import Buffer
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--binary", required=True)
@@ -86,6 +88,7 @@ class RelocalizationTest(unittest.TestCase):
         cls.step = 0
         cls.outputs = []
         cls.transforms = []
+        cls.tf_buffer = None
         cls.statuses = []
         cls.maps = []
         cls.local_inputs = {}
@@ -98,7 +101,7 @@ class RelocalizationTest(unittest.TestCase):
         cls.seed_pub = cls.node.create_publisher(PoseWithCovarianceStamped, "/initialpose", 10)
         cls.pose_sub = cls.node.create_subscription(PoseStamped, "/relocalization/pose", cls.outputs.append, 20)
         cls.tf_sub = cls.node.create_subscription(
-            TFMessage, "/tf", lambda msg: cls.transforms.extend(msg.transforms), 100)
+            TFMessage, "/tf", cls.record_tf, 100)
         cls.status_sub = cls.node.create_subscription(
             DiagnosticArray, "/relocalization/status", cls.statuses.append, 20)
         cls.map_sub = cls.node.create_subscription(
@@ -128,7 +131,7 @@ class RelocalizationTest(unittest.TestCase):
             t_imu_lidar=cls.il[:3, 3].tolist(), R_imu_lidar=cls.il[:3, :3].flatten().tolist(),
             registration_rate=8.0, tf_publish_rate=40.0, num_threads=2,
             map_leaf_size=0.15, scan_leaf_size=0.15, max_scan_age=0.5, max_job_age=1.0,
-            initialization_timeout=1.0, degraded_after=0.6, tf_hold_timeout=1.2)
+            degraded_after=0.6)
         config = cls.directory / "params.yaml"
         config.write_text(yaml.safe_dump({"small_gicp_relocalizer": {"ros__parameters": params}}))
         cls.process = subprocess.Popen(
@@ -152,6 +155,13 @@ class RelocalizationTest(unittest.TestCase):
         cls.log.close()
         cls.node.destroy_node()
         rclpy.shutdown()
+
+    @classmethod
+    def record_tf(cls, message):
+        cls.transforms.extend(message.transforms)
+        if cls.tf_buffer is not None:
+            for transform in message.transforms:
+                cls.tf_buffer.set_transform(transform, "synthetic_test")
 
     @classmethod
     def ob(cls, seconds):
@@ -282,6 +292,7 @@ class RelocalizationTest(unittest.TestCase):
         self.assert_correction()
 
     def test_04_bad_reinitialization_preserves_valid_context(self):
+        self.pump(0.35, clouds=False)  # Drain results submitted before the new seed.
         previous = len(self.outputs)
         before = len(self.globals())
         bad = self.mo @ self.ob(self.time)
@@ -291,6 +302,7 @@ class RelocalizationTest(unittest.TestCase):
         self.assertEqual(len(self.outputs), previous)
         self.assertGreater(len(self.globals()), before)
         self.assert_correction()
+        self.seed()  # Replace the retained invalid seed with a valid manual request.
         self.wait_pose(previous, timeout=2.5)
         self.pump(0.6)
         self.assert_correction()
@@ -307,17 +319,35 @@ class RelocalizationTest(unittest.TestCase):
         self.pump(0.6)
         self.assert_correction()
 
-    def test_06_stale_correction_stops_refresh_and_recovers(self):
+    def test_06_stale_correction_keeps_tf_queries_working_and_recovers(self):
+        type(self).tf_buffer = Buffer()
+        self.addCleanup(setattr, type(self), "tf_buffer", None)
+        self.pump(0.35, clouds=False)  # Finish a scan already in flight.
+        previous = len(self.outputs)
+        held = self.globals()[-1].transform
         self.pump(1.7, clouds=False)
         count = len(self.globals())
         self.pump(0.5, clouds=False)
-        self.assertEqual(len(self.globals()), count)
+        self.assertGreater(len(self.globals()), count)
+
+        # Advance beyond the default 10-second TF cache while odometry keeps moving.
+        type(self).time += 12.0
+        self.pump(0.6, clouds=False)
+        self.assertEqual(len(self.outputs), previous)
         state, values = self.latest_status()
         self.assertEqual(state, "DEGRADED")
-        self.assertEqual(values["tf_refreshing"], "false")
-        self.wait_pose(len(self.outputs))
+        self.assertEqual(values["tf_refreshing"], "true")
+        self.assertGreater(float(values["correction_age_s"]), 12.0)
+        self.assertEqual(self.globals()[-1].transform, held)
+        for target, source in [("map", "odom"), ("odom", "base_link"), ("map", "base_link")]:
+            result = self.tf_buffer.lookup_transform(target, source, RosTime())
+            seconds = result.header.stamp.sec + result.header.stamp.nanosec * 1e-9
+            self.assertLess(abs(self.time - seconds), 0.1)
+
+        self.wait_pose(previous)
         self.pump(0.5)
         self.assert_correction()
+        self.assertEqual(self.latest_status()[0], "TRACKING")
 
     def test_07_graph_and_local_tf_are_untouched(self):
         publishers = self.node.get_publisher_names_and_types_by_node("small_gicp_relocalizer", "/")
