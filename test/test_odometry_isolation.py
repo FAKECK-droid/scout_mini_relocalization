@@ -108,7 +108,7 @@ def run_replay(enabled, directory, world_points, pcd):
                 [args.binary, "--ros-args", "--params-file", str(config)], stdout=log, stderr=log)
             processes.append(reloc)
         static_pub.publish(TFMessage(transforms=[
-            helpers.RelocalizationTest.tf("base_link", "lidar", bl, 0.0)]))
+            helpers.RelocalizationTest.tf("base_link", "body", bi, 0.0)]))
         deadline = time.monotonic()+6
         while time.monotonic() < deadline:
             spin(node, 0.05)

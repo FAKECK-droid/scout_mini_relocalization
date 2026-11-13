@@ -78,9 +78,13 @@ public:
     map_frame_ = declare_parameter<std::string>("map_frame", "map");
     odom_frame_ = declare_parameter<std::string>("odom_frame", "odom");
     base_frame_ = declare_parameter<std::string>("base_frame", "base_link");
-    cloud_frame_ = declare_parameter<std::string>("cloud_frame", "body");
-    lidar_frame_ = declare_parameter<std::string>("lidar_frame", "lidar");
-    const std::vector<std::string> frames{map_frame_, odom_frame_, base_frame_, cloud_frame_, lidar_frame_};
+    // Keep accepting existing launch/YAML parameters. Input geometry comes only
+    // from the cloud's actual frame and its scan-time TF, not these legacy values.
+    declare_parameter<std::string>("cloud_frame", "body");
+    declare_parameter<std::string>("lidar_frame", "lidar");
+    declare_parameter<std::vector<double>>("t_imu_lidar", std::vector<double>{});
+    declare_parameter<std::vector<double>>("R_imu_lidar", std::vector<double>{});
+    const std::vector<std::string> frames{map_frame_, odom_frame_, base_frame_};
     for (size_t i = 0; i < frames.size(); ++i) {
       if (frames[i].empty() || frames[i].front() == '/') {
         throw std::invalid_argument("frame names must be nonempty without a leading slash");
@@ -89,9 +93,6 @@ public:
         if (frames[i] == frames[j]) {throw std::invalid_argument("frame roles must be distinct");}
       }
     }
-    imu_lidar_ = make_transform(
-      declare_parameter<std::vector<double>>("t_imu_lidar", std::vector<double>{}),
-      declare_parameter<std::vector<double>>("R_imu_lidar", std::vector<double>{}));
     registration_rate_ = positive("registration_rate", 1.0);
     const double tf_rate = positive("tf_publish_rate", 20.0);
     map_leaf_ = positive("map_leaf_size", 0.30);
@@ -154,8 +155,8 @@ public:
     timer_ = create_wall_timer(
       std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration<double>(1.0 / tf_rate)),
       [this]() {tick();});
-    RCLCPP_INFO(get_logger(), "Map loaded (%zu points). Waiting for initialpose and static %s <- %s TF",
-      target_->size(), base_frame_.c_str(), lidar_frame_.c_str());
+    RCLCPP_INFO(get_logger(), "Map loaded (%zu points). Waiting for initialpose and scan-time TF to %s",
+      target_->size(), base_frame_.c_str());
   }
 
   ~Relocalizer() override
@@ -174,7 +175,7 @@ private:
   struct Job
   {
     Cloud::ConstSharedPtr cloud;
-    Eigen::Isometry3d odom_base, base_body, guess;
+    Eigen::Isometry3d odom_base, base_cloud, guess;
     int64_t stamp;
     uint64_t generation;
     bool initializing;
@@ -238,7 +239,10 @@ private:
   void on_cloud(Cloud::ConstSharedPtr cloud)
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (cloud->header.frame_id != cloud_frame_) {reason_ = "wrong_cloud_frame"; return;}
+    if (cloud->header.frame_id.empty() || cloud->header.frame_id.front() == '/') {
+      reason_ = "invalid_cloud_frame";
+      return;
+    }
     const int64_t stamp = rclcpp::Time(cloud->header.stamp).nanoseconds();
     if (stamp <= 0) {reason_ = "invalid_cloud_stamp"; return;}
     if (stamp <= dispatched_stamp_ ||
@@ -292,6 +296,10 @@ private:
   bool lookup(const std::string & target, const std::string & source,
     int64_t stamp, Eigen::Isometry3d & output)
   {
+    if (target == source) {
+      output = Eigen::Isometry3d::Identity();
+      return true;
+    }
     try {
       output = from_tf(buffer_.lookupTransform(
         target, source, rclcpp::Time(stamp, get_clock()->get_clock_type()),
@@ -360,19 +368,6 @@ private:
     last_clock_ = clock_now;
     if (clock_now <= 0) {return;}
 
-    if (!base_body_) {
-      try {
-        const auto mount = buffer_.lookupTransform(base_frame_, lidar_frame_, tf2::TimePointZero);
-        // A path through odom/body would include motion and have a nonzero stamp.
-        if (rclcpp::Time(mount.header.stamp).nanoseconds() != 0) {
-          reason_ = "mount_tf_must_be_static";
-        } else {
-          base_body_ = from_tf(mount.transform) * imu_lidar_.inverse();
-        }
-      } catch (const std::exception &) {
-        reason_ = "waiting_static_mount_tf";
-      }
-    }
     if (pending_pose_) {
       Eigen::Isometry3d odom_base;
       // A manual map pose is a coarse seed. Latest odometry avoids rejecting a
@@ -393,20 +388,22 @@ private:
     }
     // Manual initialization has no deadline; keep trying fresh scans until it
     // succeeds or a newer /initialpose replaces it.
-    if (!pending_pose_ && !busy_ && !job_ && base_body_ && (seed_ || correction_) &&
+    if (!pending_pose_ && !busy_ && !job_ && (seed_ || correction_) &&
       latest_cloud_ && wall >= next_job_)
     {
       const auto stamp = rclcpp::Time(latest_cloud_->header.stamp).nanoseconds();
       const double age = (clock_now - stamp) * 1e-9;
       last_cloud_age_ = age;
-      Eigen::Isometry3d odom_base;
+      Eigen::Isometry3d odom_base, base_cloud;
       if (stamp <= dispatched_stamp_) {
         latest_cloud_.reset();
       } else if (age > max_scan_age_ || age < 0.0) {
         latest_cloud_.reset();
         fail("stale_or_future_cloud");
         next_job_ = wall + period();
-      } else if (!lookup(odom_frame_, base_frame_, stamp, odom_base)) {
+      } else if (!lookup(odom_frame_, base_frame_, stamp, odom_base) ||
+        !lookup(base_frame_, latest_cloud_->header.frame_id, stamp, base_cloud))
+      {
         reason_ = "waiting_cloud_tf";
         if (std::chrono::duration<double>(wall - cloud_received_).count() > tf_wait_) {
           latest_cloud_.reset();
@@ -425,7 +422,7 @@ private:
           previous_odom_stamp_ = stamp;
           const bool initializing = seed_.has_value();
           const Eigen::Isometry3d predicted = (initializing ? *seed_ : *correction_) * odom_base;
-          job_ = Job{latest_cloud_, odom_base, *base_body_, predicted, stamp,
+          job_ = Job{latest_cloud_, odom_base, base_cloud, predicted, stamp,
             generation_, initializing, wall};
           latest_cloud_.reset();
           dispatched_stamp_ = stamp;
@@ -486,7 +483,7 @@ private:
     points.reserve(raw.size());
     for (const auto & p : raw) {
       if (std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z)) {
-        points.push_back(job.base_body * Eigen::Vector3d(p.x, p.y, p.z));
+        points.push_back(job.base_cloud * Eigen::Vector3d(p.x, p.y, p.z));
       }
     }
     return points;
@@ -641,9 +638,8 @@ private:
     status_pub_->publish(message);
   }
 
-  std::string map_frame_, odom_frame_, base_frame_, cloud_frame_, lidar_frame_;
-  Eigen::Isometry3d imu_lidar_;
-  std::optional<Eigen::Isometry3d> base_body_, requested_pose_, pending_pose_, seed_;
+  std::string map_frame_, odom_frame_, base_frame_;
+  std::optional<Eigen::Isometry3d> requested_pose_, pending_pose_, seed_;
   std::optional<Eigen::Isometry3d> confirmed_, correction_, previous_odom_;
   double registration_rate_, map_leaf_, scan_leaf_, min_ratio_, max_rmse_;
   double init_translation_, init_rotation_, track_translation_, track_rotation_;

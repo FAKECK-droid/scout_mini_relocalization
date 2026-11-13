@@ -1,7 +1,8 @@
 # Scout Mini small_gicp 最小重定位
 
-基于固定 PCD 地图、RViz 粗位姿和 FAST-LIO 已去畸变的单帧 body 点云，
-持续低频 GICP 配准。仅广播动态 `map → odom`，由 EKF 独占
+基于固定 PCD 地图、RViz 粗位姿和带时间戳的单帧 PointCloud2，
+持续低频 GICP 配准。默认接收 FAST-LIO body 点云，也可接入具有有效 TF 的相机点云。
+仅广播动态 `map → odom`，由 EKF 独占
 `odom → base_link`。没有里程计输出、EKF set_pose 调用或运动控制接口。
 
 ## 坐标与外参
@@ -9,18 +10,34 @@
 `T_A_B` 将 B 点变换到 A。map 就是选定 PCD 的原生坐标，加载时不旋转地图。
 FAST-LIO 保存的地图属于建图那次运行的 camera_init；请确认地图来源和高度。
 
-- `T_base_lidar` 从 TF buffer 查询静态 `base_link ← lidar`。非零时间戳的
-  动态路径不接受，避免把经过 EKF/LIO 两套运动位姿的路径当成安装外参。
-- `T_imu_lidar` 从同一 FAST-LIO YAML 的 `mapping.extrinsic_T/R` 读取。
-  body 是 IMU，`T_base_body = T_base_lidar × inverse(T_imu_lidar)`。
-- 每帧在扫描时间 t 精确查询 `T_odom_base(t)`，不回退到最新 TF。
+- 输入坐标系 C 直接取 `cloud.header.frame_id`，不能为空或以 `/` 开头。
+- 每帧在扫描时间 t 精确查询 `T_base_C(t)`，将实际 XYZ 转到 base_link。
+  输入已在 base_link 下时使用单位变换；静态和动态 TF 路径均可使用，不缓存某一帧的外参。
+- 同时精确查询 `T_odom_base(t)`；两项 TF 均不回退到最新值，缺失时等待或拒收扫描。
 - `T_map_base = align(map, scan_base, guess).T_target_source`。
 - `T_map_odom = T_map_base × inverse(T_odom_base(t))`。
 
-现有 bringup 已强制 FAST-LIO 的 `mapping.extrinsic_est_en=false`。
-独立启动时也必须接入使用同一固定 IMU–雷达外参的 LIO；若运行实例
-在线估计外参，静态 YAML 无法代表其当前外参，应先关闭在线估计。
-本包不新增 body 与 base_link 的 TF 边。
+节点保留 `cloud_frame`、`lidar_frame`、`t_imu_lidar`、`R_imu_lidar` 参数声明，
+以兼容现有 launch 和 YAML，但这些旧参数不再限制输入 frame 或参与点云变换。
+本包不新增任何安装 TF；输入消息中的 frame 必须真实描述 XYZ 所属坐标系。
+body 仍表示 FAST-LIO 的 IMU。若 body 到 base_link 的 TF 经过 camera_init/odom，
+程序会采用该扫描时刻的动态组合结果，不再使用原先由安装外参计算的固定变换；
+这条路径可能包含 LIO/EKF 的位姿差异，不能将其当作纯安装外参。
+输入变换也不应依赖本节点尚未建立的 map → odom，以免初始化产生循环依赖。
+
+launch 和 YAML 保持原样，因此现有 launch 仍读取 FAST-LIO 配置并检查 body 点云发布开关。
+默认订阅话题仍为 `/cloud_registered_body`。接入相机时可在直接运行节点时覆盖
+`cloud_topic` 或使用 ROS remap；仅接受不同 frame 不会自动选择另一条点云话题。
+例如，已有相机 TF、局部里程计和人工初值来源时，可直接运行：
+
+```bash
+ros2 run scout_mini_relocalization small_gicp_relocalizer --ros-args \
+  --params-file "$(ros2 pkg prefix scout_mini_relocalization)/share/scout_mini_relocalization/config/relocalization.yaml" \
+  -p prior_pcd_file:=/absolute/path/to/map.pcd \
+  -p cloud_topic:=/camera/depth/points
+```
+
+相机点云与原雷达点云的密度、视场和噪声不同，配准质量与参数仍需通过录包验证。
 
 ## 构建
 
@@ -69,9 +86,9 @@ RViz Fixed Frame 设为 `map`，用 2D Pose Estimate 给出 map 中
 
 | 接口 | 方向 | 说明 |
 | --- | --- | --- |
-| /cloud_registered_body | 订阅 PointCloud2，best effort，深度 1 | 有时间戳的 body 帧、FLOAT32 XYZ；输入话题和 frame 可配 |
+| /cloud_registered_body（默认） | 订阅 PointCloud2，best effort，深度 1 | 有时间戳的 FLOAT32 XYZ；话题可配，坐标系取消息 header.frame_id 并通过扫描时刻 TF 转到 base_link |
 | /initialpose | 订阅 PoseWithCovarianceStamped | frame 必须为 map；表达 base_link；默认与最新可用里程计 TF 配对；可切换严格时间戳模式 |
-| /tf、/tf_static | 读取 | 静态安装外参、扫描时刻的 EKF TF，以及初始化使用的里程计 TF |
+| /tf、/tf_static | 读取 | 扫描时刻的输入 frame → base_link、EKF TF，以及初始化使用的里程计 TF |
 | map → odom | 唯一 TF 输出 | 当前 ROS 时间刷新最近接受的修正，无未来时间偏移 |
 | /relocalization/pose | 发布 PoseStamped | 扫描时间的 map 中 base_link 位姿 |
 | /relocalization/map_cloud | 发布 PointCloud2 | 降采样先验地图，reliable/transient_local，深度 1 |
@@ -104,8 +121,10 @@ ROS 时间回退、观测到显著 odom 跳变时作废旧修正；未确认的�
 `relocalization_geometry` 验证非单位 EKF、安装外参、初值推进、
 map→odom 确认、source→target 配准方向和质量门限。
 `relocalization_integration` 在本机隔离 ROS 域 230 中仅运行重定位节点、
-合成扫描和模拟 EKF TF，覆盖初值、移动、错误 frame、空扫描、缺失 TF、
-重新初始化、定位退化期间的 TF 连续查询、时间回退、odom 跳变和退出后的局部 TF。
+合成扫描和模拟 EKF TF，覆盖 body、相机多级光学系、base_link 和 odom 输入，
+以及动态传感器 TF 的扫描时刻查询和缺失时不回退到最新值。还覆盖初值、移动、
+无效 frame、空扫描、缺失 TF、重新初始化、定位退化期间的 TF 连续查询、
+时间回退、odom 跳变和退出后的局部 TF。
 `scout_mini_nav` 的原有几何、真实 EKF 软件融合测试应继续通过；
 新增 launch 契约测试验证开关、地图路径、外参数值一致和静态占位移除。
 

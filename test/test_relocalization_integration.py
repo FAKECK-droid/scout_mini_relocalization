@@ -110,6 +110,9 @@ class RelocalizationTest(unittest.TestCase):
         cls.il = transform([-0.011, -0.02329, 0.04412], [0.09, -0.08, 0.13])
         cls.bl = transform([0.07, -0.09, 0.145], [0.11, -0.12, -1.1])
         cls.bi = cls.bl @ np.linalg.inv(cls.il)
+        cls.camera_mount = transform([0.35, -0.12, 0.65], [0.02, -0.07, 0.35])
+        cls.camera_optical = transform([0.015, 0, 0.03], [-math.pi/2, 0, -math.pi/2])
+        cls.bc = cls.camera_mount @ cls.camera_optical
         cls.mo = transform([4.0, -3.0, 0.5], [0.04, -0.06, 0.35])
         points = []
         for x in np.linspace(-3, 3, 35):
@@ -126,7 +129,10 @@ class RelocalizationTest(unittest.TestCase):
                 f"TYPE F F F\nCOUNT 1 1 1\nWIDTH {len(points)}\nHEIGHT 1\n"
                 f"VIEWPOINT 0 0 0 1 0 0 0\nPOINTS {len(points)}\nDATA ascii\n")
             np.savetxt(stream, np.array(points), fmt="%.8f")
-        params = dict(
+        # Load the unchanged production YAML, including legacy cloud_frame/body values.
+        params = yaml.safe_load((Path(__file__).resolve().parents[1] /
+                                 "config/relocalization.yaml").read_text())["small_gicp_relocalizer"]["ros__parameters"]
+        params.update(
             use_sim_time=True, prior_pcd_file=str(pcd),
             t_imu_lidar=cls.il[:3, 3].tolist(), R_imu_lidar=cls.il[:3, :3].flatten().tolist(),
             registration_rate=8.0, tf_publish_rate=40.0, num_threads=2,
@@ -136,7 +142,11 @@ class RelocalizationTest(unittest.TestCase):
         config.write_text(yaml.safe_dump({"small_gicp_relocalizer": {"ros__parameters": params}}))
         cls.process = subprocess.Popen(
             [args.binary, "--ros-args", "--params-file", str(config)], stdout=cls.log, stderr=cls.log)
-        cls.static_pub.publish(TFMessage(transforms=[cls.tf("base_link", "lidar", cls.bl, 0.0)]))
+        # No lidar TF is supplied: body and camera inputs must use their own TF.
+        cls.static_pub.publish(TFMessage(transforms=[
+            cls.tf("base_link", "body", cls.bi, 0.0),
+            cls.tf("base_link", "camera_link", cls.camera_mount, 0.0),
+            cls.tf("camera_link", "camera_color_optical_frame", cls.camera_optical, 0.0)]))
         cls.pump(1.0)
         if cls.process.poll() is not None:
             raise AssertionError("relocalizer exited; see retained node log")
@@ -179,8 +189,22 @@ class RelocalizationTest(unittest.TestCase):
         return msg
 
     @classmethod
+    def moving_camera(cls, seconds):
+        elapsed = seconds-1000.0
+        return transform([0.4+0.5*math.sin(2*elapsed), -0.2+0.3*math.cos(3*elapsed), 0.7],
+                         [0.15*math.sin(2*elapsed), 0.2*math.cos(3*elapsed), 1.2*math.sin(2*elapsed)])
+
+    @classmethod
     def cloud(cls, seconds, frame="body", empty=False, distant=False):
         matrix = cls.bi
+        if frame == "camera_color_optical_frame":
+            matrix = cls.bc
+        elif frame == "base_link":
+            matrix = np.eye(4)
+        elif frame == "odom":
+            matrix = np.linalg.inv(cls.ob(seconds))
+        elif frame == "moving_camera_optical_frame":
+            matrix = cls.moving_camera(seconds)
         base = cls.mo @ cls.ob(seconds)
         points = (np.linalg.inv(matrix) @ np.linalg.inv(base) @ cls.world_points.T).T[:, :3]
         if distant:
@@ -191,7 +215,8 @@ class RelocalizationTest(unittest.TestCase):
             Header(stamp=stamp(seconds), frame_id=frame), points.tolist())
 
     @classmethod
-    def pump(cls, duration, clouds=True, odom=True, frame="body", empty=False, distant=False, jump=False):
+    def pump(cls, duration, clouds=True, odom=True, frame="body", empty=False, distant=False,
+             jump=False, sensor_tf=True, delay=0.02):
         end = time.monotonic()+duration
         while time.monotonic() < end:
             cls.time += 0.02
@@ -204,8 +229,11 @@ class RelocalizationTest(unittest.TestCase):
                 message = cls.tf("odom", "base_link", local, cls.time)
                 cls.local_inputs[(message.header.stamp.sec, message.header.stamp.nanosec)] = local
                 cls.tf_pub.publish(TFMessage(transforms=[message]))
+            if sensor_tf:
+                cls.tf_pub.publish(TFMessage(transforms=[cls.tf(
+                    "base_link", "moving_camera_optical_frame", cls.moving_camera(cls.time), cls.time)]))
             if clouds and cls.step % 5 == 0:
-                cls.cloud_pub.publish(cls.cloud(cls.time-0.02, frame, empty, distant))
+                cls.cloud_pub.publish(cls.cloud(cls.time-delay, frame, empty, distant))
             cls.step += 1
             target = time.monotonic()+0.02
             while time.monotonic() < target:
@@ -277,12 +305,49 @@ class RelocalizationTest(unittest.TestCase):
         for tf in self.globals():
             self.assertEqual(tf.child_frame_id, "odom")
 
-    def test_03_wrong_frame_empty_cloud_and_missing_tf_keep_old_correction(self):
-        self.pump(0.35, clouds=False)  # Drain an already valid in-flight scan.
+    def test_02b_camera_optical_base_and_odom_frames_use_message_frame(self):
+        for frame in ("camera_color_optical_frame", "base_link", "odom"):
+            with self.subTest(frame=frame):
+                self.pump(0.35, clouds=False)
+                previous = len(self.outputs)
+                self.pump(0.8, frame=frame)
+                self.assertGreater(len(self.outputs), previous)
+                output = self.outputs[-1]
+                seconds = output.header.stamp.sec+output.header.stamp.nanosec*1e-9
+                np.testing.assert_allclose(matrix_from_pose(output.pose),
+                                           self.mo @ self.ob(seconds), atol=0.03)
+                self.assert_correction()
+
+    def test_02c_dynamic_input_tf_uses_scan_time_without_latest_fallback(self):
+        self.pump(0.35, clouds=False)
         previous = len(self.outputs)
-        self.pump(0.7, frame="lidar")
+        self.pump(1.0, frame="moving_camera_optical_frame", delay=0.20)
+        self.assertGreater(len(self.outputs), previous)
+        output = self.outputs[-1]
+        seconds = output.header.stamp.sec+output.header.stamp.nanosec*1e-9
+        np.testing.assert_allclose(matrix_from_pose(output.pose),
+                                   self.mo @ self.ob(seconds), atol=0.03)
+        self.assert_correction()
+
+        # Keep odom current but stop only the dynamic sensor TF. An old/latest
+        # sensor transform must not be substituted for the missing scan-time TF.
+        self.pump(0.35, clouds=False, sensor_tf=False)
+        previous = len(self.outputs)
+        self.pump(0.7, frame="moving_camera_optical_frame", sensor_tf=False, delay=0.20)
         self.assertEqual(len(self.outputs), previous)
         self.assert_correction()
+        self.pump(0.8, frame="moving_camera_optical_frame", delay=0.20)
+        self.assertGreater(len(self.outputs), previous)
+        self.assert_correction()
+
+    def test_03_invalid_frame_empty_cloud_and_missing_tf_keep_old_correction(self):
+        self.pump(0.35, clouds=False)  # Drain an already valid in-flight scan.
+        previous = len(self.outputs)
+        for frame in ("", "/body", "unconnected_camera"):
+            with self.subTest(frame=frame):
+                self.pump(0.6, frame=frame)
+                self.assertEqual(len(self.outputs), previous)
+                self.assert_correction()
         self.pump(0.6, empty=True)
         self.assertEqual(len(self.outputs), previous)
         self.pump(0.6, odom=False)
