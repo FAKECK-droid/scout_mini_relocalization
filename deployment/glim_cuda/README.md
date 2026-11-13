@@ -27,3 +27,14 @@ ros2 pkg executables glim_ros
 此环境只对 source 它的当前 shell 生效；不修改 shell 启动文件或现有导航 launch。
 默认包配置不保证适合 Femto Bolt，不应直接并入底盘 bringup。实机使用前需准备
 点云/IMU 的时间与外参、话题和输出 TF 归属，并单独验证所选版本的性能。
+
+## CUDA 运行验证
+
+```powershell
+ssh jetson-orin 'source ~/ros2_ws/tools/glim_cuda/setup.bash && python3 ~/ros2_ws/src/scout_mini_relocalization/deployment/glim_cuda/smoke.py'
+```
+
+脚本固定使用 DDS domain 228 和 localhost，发布静止三维场景与重力 IMU，
+关闭全局建图和 GUI，保留 ROS 输出插件。验证 CUDA context、GPU 里程计模块、
+CUDA 因子库及有效 Odometry 输出。所有配置与日志保留在 tools/glim_cuda/qa 下。
+该测试仅证明 GPU 运行路径可用，不代表真实 Femto Bolt 的精度或实时性能。

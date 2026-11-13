@@ -125,8 +125,8 @@ _glim_cuda_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source /opt/ros/humble/setup.bash
 export GLIM_CUDA_ROOT="$_glim_cuda_root"
 export AMENT_PREFIX_PATH="$_glim_cuda_root/sysroot/opt/ros/humble:${AMENT_PREFIX_PATH:-}"
-export CMAKE_PREFIX_PATH="$_glim_cuda_root/sysroot/opt/ros/humble:$_glim_cuda_root/sysroot/usr:${CMAKE_PREFIX_PATH:-}"
-export LD_LIBRARY_PATH="$_glim_cuda_root/sysroot/opt/ros/humble/lib:$_glim_cuda_root/sysroot/usr/lib:$_glim_cuda_root/sysroot/usr/lib/aarch64-linux-gnu:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
+export CMAKE_PREFIX_PATH="$_glim_cuda_root/sysroot/opt/ros/humble:$_glim_cuda_root/sysroot/usr/local:$_glim_cuda_root/sysroot/usr:${CMAKE_PREFIX_PATH:-}"
+export LD_LIBRARY_PATH="$_glim_cuda_root/sysroot/opt/ros/humble/lib:$_glim_cuda_root/sysroot/usr/local/lib:$_glim_cuda_root/sysroot/usr/lib:$_glim_cuda_root/sysroot/usr/lib/aarch64-linux-gnu:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
 export PATH="$_glim_cuda_root/sysroot/opt/ros/humble/bin:$_glim_cuda_root/sysroot/usr/bin:$PATH"
 unset _glim_cuda_root
 """)
