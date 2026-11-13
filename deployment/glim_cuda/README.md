@@ -1,40 +1,53 @@
-# Jetson GLIM CUDA 12.6 部署
+# GLIM CUDA：标准 ROS 2 功能包部署
 
-目标为本项目已确认的 ARM64 Jetson、Ubuntu 22.04、ROS 2 Humble 和 CUDA 12.6。
-固定 GLIM/glim_ros/gtsam_points 1.2.2、GTSAM 4.3.0、Iridescence 1.0.2。
-来源为作者官方 PPA：https://koide3.github.io/ppa/ubuntu2204/ 。
-脚本验证 Release.gpg、Packages.gz 与每个 deb 的 SHA256，并解包到所选工作空间
-的 tools/glim_cuda/sysroot；不运行包维护脚本、不修改 /etc、/usr 或 /opt，不需要 sudo。
-现有系统运行库仍由宿主提供，安装后必须检查 ldd 和 GPU 模块实际加载结果。
+两端源代码放在工作空间的 src 中，Jetson 使用 colcon 构建。固定官方 v1.2.2：
 
-## 从桌面 SSH 执行
+| 源码目录 | ROS 2 包名 | 上游与提交 |
+| --- | --- | --- |
+| src/glim | glim | https://github.com/koide3/glim ，faa264a1bce1bda406f73457e35511f56cdc2eaa |
+| src/glim_ros2 | glim_ros | https://github.com/koide3/glim_ros2 ，fc72f4603ed2d3dffcdf94cda5617963afe57e82 |
 
-先将本仓库提交推送，并在 Jetson git pull --ff-only。目标路径须在执行前核实。
+构建输出使用工作空间原有的 build/glim、build/glim_ros、install/glim、
+install/glim_ros 和 log。不向 src 放置编译产物，也不修改现有导航 launch/config。
 
-```powershell
-ssh jetson-orin 'python3 ~/ros2_ws/src/scout_mini_relocalization/deployment/glim_cuda/install.py --workspace ~/ros2_ws'
-```
+## 系统依赖
 
-网络需要桌面代理时，可使用仅绑定回环地址的临时 SSH 反向转发，
-再给脚本传入 --proxy http://127.0.0.1:17890；不需要启用 TUN 或修改路由。
+Jetson 为 Ubuntu 22.04、Humble、CUDA 12.6。官方 PPA：
+https://koide3.github.io/ppa/ubuntu2204/ 。
+
+通过已授权的 sudo 正常安装 libgtsam-points-cuda12.6-dev=1.2.2、
+libiridescence-dev=1.0.2，以及 libglfw3-dev、libglm-dev、libmetis-dev、libomp-dev。
+GTSAM 由上述依赖安装。软件源使用单独的 signed-by 密钥；无需自定义运行时 sysroot。
+sudo 密码不写入任何脚本、文件或日志。
+
+## Jetson 构建与使用
+
+全部开发板操作从开发机通过 ssh jetson-orin 执行。进入已核实的工作空间后：
 
 ```bash
-source ~/ros2_ws/tools/glim_cuda/setup.bash
+source /opt/ros/humble/setup.bash
+cd ~/ros2_ws
+CMAKE_BUILD_PARALLEL_LEVEL=2 MAKEFLAGS=-j2 colcon build \
+  --base-paths src/glim src/glim_ros2 --packages-select glim glim_ros \
+  --executor sequential --cmake-args -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_WITH_CUDA=ON -DBUILD_WITH_VIEWER=ON \
+  -DBUILD_WITH_MARCH_NATIVE=OFF -DBUILD_TESTING=OFF \
+  -DCUDAToolkit_ROOT=/usr/local/cuda-12.6
+source install/setup.bash
+ros2 pkg prefix glim
 ros2 pkg prefix glim_ros
 ros2 pkg executables glim_ros
 ```
 
-此环境只对 source 它的当前 shell 生效；不修改 shell 启动文件或现有导航 launch。
-默认包配置不保证适合 Femto Bolt，不应直接并入底盘 bringup。实机使用前需准备
-点云/IMU 的时间与外参、话题和输出 TF 归属，并单独验证所选版本的性能。
-
-## CUDA 运行验证
+## GPU 验证
 
 ```powershell
-ssh jetson-orin 'source ~/ros2_ws/tools/glim_cuda/setup.bash && python3 ~/ros2_ws/src/scout_mini_relocalization/deployment/glim_cuda/smoke.py'
+ssh jetson-orin 'source ~/ros2_ws/install/setup.bash && python3 ~/ros2_ws/src/scout_mini_relocalization/deployment/glim_cuda/smoke.py --workspace ~/ros2_ws'
 ```
 
-脚本固定使用 DDS domain 228 和 localhost，发布静止三维场景与重力 IMU，
-关闭全局建图和 GUI，保留 ROS 输出插件。验证 CUDA context、GPU 里程计模块、
-CUDA 因子库及有效 Odometry 输出。所有配置与日志保留在 tools/glim_cuda/qa 下。
-该测试仅证明 GPU 运行路径可用，不代表真实 Femto Bolt 的精度或实时性能。
+验证脚本只接受所选工作空间 install 下的 GLIM，检查实际进程中的 GPU 模块和
+CUDA 因子库。使用 DDS domain 228、localhost、合成点云及 IMU；关闭 GUI 和全局建图，
+不启动真实底盘或相机。配置与日志位于 log/glim_cuda。
+
+这只验证软件 CUDA 计算路径，不代表真实 Femto Bolt 精度或实时性能。
+真实点云/IMU 的时间、外参与话题接入仍需单独配置。

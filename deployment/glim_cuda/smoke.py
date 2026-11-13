@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Exercise the deployed GPU odometry using synthetic points/IMU in DDS domain 228."""
+import argparse
 import ctypes
 import json
 import math
@@ -16,6 +17,7 @@ os.environ["ROS_LOCALHOST_ONLY"] = "1"
 
 import numpy as np
 import rclpy
+from ament_index_python.packages import get_package_prefix
 from builtin_interfaces.msg import Time
 from nav_msgs.msg import Odometry
 from rclpy.qos import qos_profile_sensor_data
@@ -32,14 +34,20 @@ def load_json(path):
 
 
 def main():
-    root = Path(os.environ["GLIM_CUDA_ROOT"]).resolve(strict=True)
-    qa = root / "qa"
-    qa.mkdir(exist_ok=True)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--workspace", type=Path, required=True)
+    arguments = parser.parse_args()
+    root = arguments.workspace.expanduser().resolve(strict=True)
+    qa = root / "log/glim_cuda"
+    qa.mkdir(parents=True, exist_ok=True)
     output = Path(tempfile.mkdtemp(prefix="cuda-smoke-", dir=qa))
     os.environ["ROS_LOG_DIR"] = str(output / "ros-log")
-    prefix = root / "sysroot/opt/ros/humble"
-    libraries = (prefix / "lib/libodometry_estimation_gpu.so",
-                 root / "sysroot/usr/local/lib/libgtsam_points_cuda.so")
+    prefix = Path(get_package_prefix("glim")).resolve(strict=True)
+    ros_prefix = Path(get_package_prefix("glim_ros")).resolve(strict=True)
+    for package_prefix in (prefix, ros_prefix):
+        if not package_prefix.is_relative_to(root / "install"):
+            raise RuntimeError("Expected a workspace colcon install: " + str(package_prefix))
+    libraries = (prefix / "lib/libodometry_estimation_gpu.so",)
     for library in libraries:
         result = subprocess.check_output(["ldd", str(library)], text=True)
         if "not found" in result:
@@ -89,7 +97,7 @@ def main():
     log = open(output / "node.log", "w")
     try:
         process = subprocess.Popen([
-            str(prefix / "lib/glim_ros/glim_rosnode"), "--ros-args",
+            str(ros_prefix / "lib/glim_ros/glim_rosnode"), "--ros-args",
             "-r", "__node:=glim_cuda_smoke", "-p", "config_path:=" + str(config),
             "-p", "dump_path:=" + str(output / "dump")], stdout=log, stderr=log)
         deadline = time.monotonic() + 10
@@ -126,8 +134,9 @@ def main():
         while time.monotonic() < deadline:
             rclpy.spin_once(node, timeout_sec=0.01)
         maps = Path(f"/proc/{process.pid}/maps").read_text()
-        assert "libodometry_estimation_gpu.so" in maps
+        assert str(prefix / "lib/libodometry_estimation_gpu.so") in maps
         assert "libgtsam_points_cuda.so" in maps
+        assert "/tools/glim_cuda/" not in maps
         assert len(poses) >= 30, f"Only {len(poses)} odometry messages"
         positions = np.array([[p.pose.pose.position.x, p.pose.pose.position.y,
                                p.pose.pose.position.z] for p in poses])
@@ -136,7 +145,8 @@ def main():
         result = dict(cuda_devices=count.value, compute_capability=f"{major.value}.{minor.value}",
                       gpu_odometry_loaded=True, cuda_factors_loaded=True,
                       odometry_messages=len(poses), final_position_m=positions[-1].tolist(),
-                      synthetic=True, artifacts=str(output))
+                      synthetic=True, glim_prefix=str(prefix), glim_ros_prefix=str(ros_prefix),
+                      artifacts=str(output))
         (output / "result.json").write_text(json.dumps(result, indent=2) + "\n")
         print(json.dumps(result), flush=True)
     finally:
